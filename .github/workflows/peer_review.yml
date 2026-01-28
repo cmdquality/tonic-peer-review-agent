@@ -1,0 +1,657 @@
+# =============================================================================
+# PR Peer Review Orchestration Workflow
+# =============================================================================
+# This workflow orchestrates multiple agents to automate the peer review process
+# for pull requests. It enforces code quality, architectural patterns, and LLD
+# alignment before allowing merges.
+#
+# Workflow Path:
+#   Fast Path (no new patterns): ~1 minute
+#   Full Path (new patterns): ~4.5 hours (includes human review)
+#
+# Version: 1.0.0
+# Date: 2026-01-28
+# =============================================================================
+
+name: PR Peer Review Orchestration
+
+# =============================================================================
+# TRIGGERS
+# =============================================================================
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    branches:
+      - main
+      - develop
+      - 'release/**'
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - '.github/ISSUE_TEMPLATE/**'
+      - '.github/PULL_REQUEST_TEMPLATE/**'
+
+  # Support for merge queues
+  merge_group:
+    types: [checks_requested]
+
+  # Manual trigger for re-running
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'PR number to review'
+        required: true
+        type: number
+
+# =============================================================================
+# CONCURRENCY CONTROL
+# =============================================================================
+# Cancel previous runs for the same PR to save resources
+concurrency:
+  group: pr-review-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+# =============================================================================
+# PERMISSIONS
+# =============================================================================
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+  checks: write
+  statuses: write
+
+# =============================================================================
+# ENVIRONMENT VARIABLES
+# =============================================================================
+env:
+  # Workflow configuration
+  WORKFLOW_VERSION: '1.0.0'
+  FAST_PATH_ENABLED: 'true'
+  AUTO_MERGE_ENABLED: 'true'
+
+  # SLA thresholds (in seconds)
+  CODE_QUALITY_SLA: 30
+  ARCHITECT_SLA: 10
+  LLD_ALIGNMENT_SLA: 20
+  PATTERN_MATCHING_SLA: 5
+  JIRA_INTEGRATION_SLA: 10
+
+# =============================================================================
+# JOBS
+# =============================================================================
+jobs:
+  # ===========================================================================
+  # JOB 1: PRE-FLIGHT VALIDATION
+  # ===========================================================================
+  # Validates the PR and determines execution path
+  pre-flight:
+    name: Pre-Flight Validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    # Skip draft PRs
+    if: github.event.pull_request.draft != true
+
+    outputs:
+      should_run: ${{ steps.validation.outputs.should_run }}
+      has_code_changes: ${{ steps.changes.outputs.code }}
+      pr_author: ${{ steps.pr-info.outputs.author }}
+      pr_author_email: ${{ steps.pr-info.outputs.author_email }}
+      workflow_id: ${{ steps.workflow-id.outputs.id }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Generate workflow ID
+        id: workflow-id
+        run: |
+          WORKFLOW_ID="wf-$(date +%Y%m%d)-pr-${{ github.event.pull_request.number }}-$(git rev-parse --short HEAD)"
+          echo "id=$WORKFLOW_ID" >> $GITHUB_OUTPUT
+          echo "::notice::Workflow ID: $WORKFLOW_ID"
+
+      - name: Get PR information
+        id: pr-info
+        run: |
+          echo "author=${{ github.event.pull_request.user.login }}" >> $GITHUB_OUTPUT
+          echo "author_email=${{ github.event.pull_request.user.email || format('{0}@users.noreply.github.com', github.event.pull_request.user.login) }}" >> $GITHUB_OUTPUT
+
+      - name: Detect file changes
+        uses: dorny/paths-filter@v2
+        id: changes
+        with:
+          filters: |
+            code:
+              - 'src/**'
+              - 'lib/**'
+              - '**/*.java'
+              - '**/*.py'
+              - '**/*.ts'
+              - '**/*.js'
+            docs:
+              - '**/*.md'
+              - 'docs/**'
+            config:
+              - '**/*.yml'
+              - '**/*.yaml'
+              - '**/*.json'
+
+      - name: Validate PR
+        id: validation
+        run: |
+          # Check for skip label
+          if [[ "${{ contains(github.event.pull_request.labels.*.name, 'skip-peer-review') }}" == "true" ]]; then
+            echo "should_run=false" >> $GITHUB_OUTPUT
+            echo "::warning::Skipping peer review due to 'skip-peer-review' label"
+            exit 0
+          fi
+
+          # Check for code changes
+          if [[ "${{ steps.changes.outputs.code }}" != "true" ]]; then
+            echo "should_run=false" >> $GITHUB_OUTPUT
+            echo "::notice::No code changes detected, skipping peer review"
+            exit 0
+          fi
+
+          echo "should_run=true" >> $GITHUB_OUTPUT
+          echo "::notice::PR validation passed, proceeding with peer review"
+
+      - name: Post workflow start comment
+        if: steps.validation.outputs.should_run == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const body = `## 🤖 PR Peer Review Started
+
+            **Workflow ID**: \`${{ steps.workflow-id.outputs.id }}\`
+            **Started**: ${new Date().toISOString()}
+
+            | Agent | Status |
+            |-------|--------|
+            | Code Quality | ⏳ Pending |
+            | Architecture | ⏳ Pending |
+            | LLD Alignment | ⏳ Pending |
+            | Peer Review | ⏳ Pending |
+
+            _This comment will be updated as agents complete._`;
+
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });
+
+  # ===========================================================================
+  # JOB 2: CODE QUALITY AGENT
+  # ===========================================================================
+  # Validates code against approved patterns from Confluence
+  code-quality-agent:
+    name: Code Quality Review
+    runs-on: ubuntu-latest
+    needs: pre-flight
+    if: needs.pre-flight.outputs.should_run == 'true'
+    timeout-minutes: 5
+
+    outputs:
+      status: ${{ steps.analysis.outputs.status }}
+      violations_count: ${{ steps.analysis.outputs.violations_count }}
+      violations: ${{ steps.analysis.outputs.violations }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup environment
+        run: |
+          echo "Starting Code Best Practises Agent"
+          echo "SLA Target: ${{ env.CODE_QUALITY_SLA }} seconds"
+
+      - name: Run code quality analysis
+        id: analysis
+        env:
+          CONFLUENCE_API_TOKEN: ${{ secrets.CONFLUENCE_API_TOKEN }}
+          CONFLUENCE_BASE_URL: ${{ secrets.CONFLUENCE_BASE_URL }}
+        run: |
+          START_TIME=$(date +%s)
+
+          # TODO: Replace with actual agent invocation
+          # For now, simulate a passing check
+          echo "Analyzing code against pattern library..."
+          sleep 2
+
+          # Simulate results
+          echo "status=PASS" >> $GITHUB_OUTPUT
+          echo "violations_count=0" >> $GITHUB_OUTPUT
+          echo 'violations=[]' >> $GITHUB_OUTPUT
+
+          END_TIME=$(date +%s)
+          DURATION=$((END_TIME - START_TIME))
+          echo "::notice::Code quality analysis completed in ${DURATION}s (SLA: ${{ env.CODE_QUALITY_SLA }}s)"
+
+      - name: Report results
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const status = '${{ steps.analysis.outputs.status }}';
+            const violations = ${{ steps.analysis.outputs.violations_count }};
+            const emoji = status === 'PASS' ? '✅' : '❌';
+
+            console.log(`Code Quality: ${emoji} ${status} (${violations} violations)`);
+
+  # ===========================================================================
+  # JOB 3: ARCHITECT AGENT
+  # ===========================================================================
+  # Detects new architectural patterns not in the approved library
+  architect-agent:
+    name: Architecture Review
+    runs-on: ubuntu-latest
+    needs: [pre-flight, code-quality-agent]
+    if: |
+      needs.pre-flight.outputs.should_run == 'true' &&
+      needs.code-quality-agent.outputs.status == 'PASS'
+    timeout-minutes: 3
+
+    outputs:
+      status: ${{ steps.analysis.outputs.status }}
+      new_pattern_found: ${{ steps.analysis.outputs.new_pattern_found }}
+      patterns: ${{ steps.analysis.outputs.patterns }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run architecture analysis
+        id: analysis
+        env:
+          CONFLUENCE_API_TOKEN: ${{ secrets.CONFLUENCE_API_TOKEN }}
+          CONFLUENCE_BASE_URL: ${{ secrets.CONFLUENCE_BASE_URL }}
+        run: |
+          START_TIME=$(date +%s)
+
+          # TODO: Replace with actual agent invocation
+          echo "Analyzing code for new architectural patterns..."
+          sleep 1
+
+          # Simulate results - no new patterns for fast path demo
+          echo "status=NO_NEW_PATTERN" >> $GITHUB_OUTPUT
+          echo "new_pattern_found=false" >> $GITHUB_OUTPUT
+          echo 'patterns=[]' >> $GITHUB_OUTPUT
+
+          END_TIME=$(date +%s)
+          DURATION=$((END_TIME - START_TIME))
+          echo "::notice::Architecture analysis completed in ${DURATION}s (SLA: ${{ env.ARCHITECT_SLA }}s)"
+
+  # ===========================================================================
+  # JOB 4: LLD ALIGNMENT AGENT (Conditional)
+  # ===========================================================================
+  # Validates new patterns against Low-Level Design specifications
+  lld-alignment-agent:
+    name: LLD Alignment Review
+    runs-on: ubuntu-latest
+    needs: [pre-flight, code-quality-agent, architect-agent]
+    if: |
+      needs.pre-flight.outputs.should_run == 'true' &&
+      needs.code-quality-agent.outputs.status == 'PASS' &&
+      needs.architect-agent.outputs.new_pattern_found == 'true'
+    timeout-minutes: 3
+
+    outputs:
+      status: ${{ steps.analysis.outputs.status }}
+      deviations: ${{ steps.analysis.outputs.deviations }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run LLD alignment analysis
+        id: analysis
+        env:
+          CONFLUENCE_API_TOKEN: ${{ secrets.CONFLUENCE_API_TOKEN }}
+          CONFLUENCE_BASE_URL: ${{ secrets.CONFLUENCE_BASE_URL }}
+        run: |
+          START_TIME=$(date +%s)
+
+          # TODO: Replace with actual agent invocation
+          echo "Validating new patterns against LLD specifications..."
+          sleep 1
+
+          # Simulate results
+          echo "status=LLD_COMPLIANT" >> $GITHUB_OUTPUT
+          echo 'deviations=[]' >> $GITHUB_OUTPUT
+
+          END_TIME=$(date +%s)
+          DURATION=$((END_TIME - START_TIME))
+          echo "::notice::LLD alignment review completed in ${DURATION}s (SLA: ${{ env.LLD_ALIGNMENT_SLA }}s)"
+
+  # ===========================================================================
+  # JOB 5: PEER REVIEW AGENT (Conditional)
+  # ===========================================================================
+  # Manages human review process for new patterns
+  peer-review-agent:
+    name: Peer Review Coordination
+    runs-on: ubuntu-latest
+    needs: [pre-flight, code-quality-agent, architect-agent, lld-alignment-agent]
+    if: |
+      always() &&
+      needs.pre-flight.outputs.should_run == 'true' &&
+      needs.code-quality-agent.outputs.status == 'PASS' &&
+      needs.architect-agent.outputs.new_pattern_found == 'true' &&
+      (needs.lld-alignment-agent.outputs.status == 'LLD_COMPLIANT' || needs.lld-alignment-agent.result == 'skipped')
+    timeout-minutes: 10
+
+    outputs:
+      status: ${{ steps.review.outputs.status }}
+      reviewers_assigned: ${{ steps.review.outputs.reviewers_assigned }}
+
+    steps:
+      - name: Assign reviewers
+        id: review
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // TODO: Replace with actual reviewer assignment logic
+            // This should query team roster and assign based on expertise
+
+            console.log('Assigning reviewers for new pattern review...');
+
+            // For demo, simulate assignment
+            core.setOutput('status', 'REVIEWERS_ASSIGNED');
+            core.setOutput('reviewers_assigned', 'architect-team');
+
+            // Post comment about review required
+            const body = `## 👥 Human Review Required
+
+            A new architectural pattern has been detected that requires review.
+
+            **Assigned Reviewers**: Architecture Team
+            **SLA**: 4 hours
+
+            Please review the pattern and approve or request changes.`;
+
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });
+
+  # ===========================================================================
+  # JOB 6: JIRA INTEGRATION (Conditional - On Failure)
+  # ===========================================================================
+  # Creates Jira tickets when checks fail
+  jira-integration:
+    name: Jira Ticket Creation
+    runs-on: ubuntu-latest
+    needs: [pre-flight, code-quality-agent, architect-agent, lld-alignment-agent]
+    if: |
+      always() &&
+      needs.pre-flight.outputs.should_run == 'true' &&
+      (needs.code-quality-agent.outputs.status == 'FAIL' ||
+       needs.lld-alignment-agent.outputs.status == 'LLD_DEVIATION_FOUND')
+    timeout-minutes: 3
+    environment: production
+
+    outputs:
+      ticket_key: ${{ steps.create-ticket.outputs.ticket_key }}
+      ticket_url: ${{ steps.create-ticket.outputs.ticket_url }}
+
+    steps:
+      - name: Determine failure type
+        id: failure-type
+        run: |
+          if [[ "${{ needs.code-quality-agent.outputs.status }}" == "FAIL" ]]; then
+            echo "type=CODE_VIOLATION" >> $GITHUB_OUTPUT
+            echo "agent=code_best_practises_agent" >> $GITHUB_OUTPUT
+          elif [[ "${{ needs.lld-alignment-agent.outputs.status }}" == "LLD_DEVIATION_FOUND" ]]; then
+            echo "type=LLD_DEVIATION" >> $GITHUB_OUTPUT
+            echo "agent=lld_alignment_review_agent" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Lookup PR author in Jira
+        id: user-lookup
+        env:
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
+          JIRA_USER_EMAIL: ${{ secrets.JIRA_USER_EMAIL }}
+        run: |
+          AUTHOR_EMAIL="${{ needs.pre-flight.outputs.pr_author_email }}"
+
+          # Lookup user in Jira
+          RESPONSE=$(curl -s -X GET \
+            "${JIRA_BASE_URL}/rest/api/3/user/search?query=${AUTHOR_EMAIL}" \
+            -H "Authorization: Basic $(echo -n ${JIRA_USER_EMAIL}:${JIRA_API_TOKEN} | base64)" \
+            -H "Content-Type: application/json" || echo '[]')
+
+          ACCOUNT_ID=$(echo $RESPONSE | jq -r '.[0].accountId // empty')
+
+          if [ -z "$ACCOUNT_ID" ]; then
+            echo "::warning::User not found in Jira, using default assignee"
+            ACCOUNT_ID="${{ secrets.DEFAULT_JIRA_ASSIGNEE_ID }}"
+            echo "assignment_method=fallback" >> $GITHUB_OUTPUT
+          else
+            echo "assignment_method=direct" >> $GITHUB_OUTPUT
+          fi
+
+          echo "account_id=$ACCOUNT_ID" >> $GITHUB_OUTPUT
+
+      - name: Create Jira ticket
+        id: create-ticket
+        env:
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
+          JIRA_USER_EMAIL: ${{ secrets.JIRA_USER_EMAIL }}
+        run: |
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          PR_URL="${{ github.event.pull_request.html_url }}"
+          PR_TITLE="${{ github.event.pull_request.title }}"
+          ISSUE_TYPE="${{ steps.failure-type.outputs.type }}"
+          ACCOUNT_ID="${{ steps.user-lookup.outputs.account_id }}"
+          WORKFLOW_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          # Create ticket JSON payload
+          TICKET_DATA=$(cat <<EOF
+          {
+            "fields": {
+              "project": {"key": "SCM"},
+              "issuetype": {"name": "Bug"},
+              "summary": "[PR-${PR_NUMBER}] ${ISSUE_TYPE} - ${PR_TITLE}",
+              "description": {
+                "type": "doc",
+                "version": 1,
+                "content": [
+                  {
+                    "type": "panel",
+                    "attrs": {"panelType": "error"},
+                    "content": [
+                      {
+                        "type": "paragraph",
+                        "content": [{"type": "text", "text": "Automated peer review detected issues that must be resolved."}]
+                      }
+                    ]
+                  },
+                  {
+                    "type": "paragraph",
+                    "content": [
+                      {"type": "text", "text": "Pull Request: "},
+                      {"type": "text", "text": "#${PR_NUMBER}", "marks": [{"type": "link", "attrs": {"href": "${PR_URL}"}}]}
+                    ]
+                  },
+                  {
+                    "type": "paragraph",
+                    "content": [
+                      {"type": "text", "text": "Workflow Logs: "},
+                      {"type": "text", "text": "View Details", "marks": [{"type": "link", "attrs": {"href": "${WORKFLOW_URL}"}}]}
+                    ]
+                  }
+                ]
+              },
+              "priority": {"name": "High"},
+              "labels": ["peer-review", "auto-created", "pr-${PR_NUMBER}"],
+              "assignee": {"accountId": "${ACCOUNT_ID}"}
+            }
+          }
+          EOF
+          )
+
+          RESPONSE=$(curl -s -X POST \
+            "${JIRA_BASE_URL}/rest/api/3/issue" \
+            -H "Authorization: Basic $(echo -n ${JIRA_USER_EMAIL}:${JIRA_API_TOKEN} | base64)" \
+            -H "Content-Type: application/json" \
+            -d "$TICKET_DATA")
+
+          TICKET_KEY=$(echo $RESPONSE | jq -r '.key // empty')
+
+          if [ -z "$TICKET_KEY" ]; then
+            echo "::error::Failed to create Jira ticket"
+            echo "Response: $RESPONSE"
+            exit 1
+          fi
+
+          echo "ticket_key=$TICKET_KEY" >> $GITHUB_OUTPUT
+          echo "ticket_url=${JIRA_BASE_URL}/browse/${TICKET_KEY}" >> $GITHUB_OUTPUT
+          echo "::notice::Created Jira ticket: $TICKET_KEY"
+
+      - name: Comment on PR with Jira link
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const ticketKey = '${{ steps.create-ticket.outputs.ticket_key }}';
+            const ticketUrl = '${{ steps.create-ticket.outputs.ticket_url }}';
+            const issueType = '${{ steps.failure-type.outputs.type }}';
+
+            const body = `## ❌ Peer Review Failed - Jira Ticket Created
+
+            **Issue Type**: ${issueType}
+            **Jira Ticket**: [${ticketKey}](${ticketUrl})
+            **Assigned To**: ${{ needs.pre-flight.outputs.pr_author }}
+
+            Please review the issues and push fixes. The PR will be re-evaluated automatically.`;
+
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });
+
+  # ===========================================================================
+  # JOB 7: FINAL REPORT
+  # ===========================================================================
+  # Aggregates results and posts final status
+  final-report:
+    name: Final Report
+    runs-on: ubuntu-latest
+    needs: [pre-flight, code-quality-agent, architect-agent, lld-alignment-agent, peer-review-agent, jira-integration]
+    if: always() && needs.pre-flight.outputs.should_run == 'true'
+    timeout-minutes: 3
+
+    steps:
+      - name: Generate summary
+        run: |
+          echo "## PR Peer Review Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Workflow ID**: ${{ needs.pre-flight.outputs.workflow_id }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Agent | Result |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Code Quality | ${{ needs.code-quality-agent.outputs.status || 'N/A' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Architecture | ${{ needs.architect-agent.outputs.status || 'N/A' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| LLD Alignment | ${{ needs.lld-alignment-agent.outputs.status || 'Skipped' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Peer Review | ${{ needs.peer-review-agent.outputs.status || 'Skipped' }} |" >> $GITHUB_STEP_SUMMARY
+
+          if [[ "${{ needs.jira-integration.outputs.ticket_key }}" != "" ]]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**Jira Ticket**: ${{ needs.jira-integration.outputs.ticket_key }}" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Determine final status
+        id: final-status
+        run: |
+          CODE_STATUS="${{ needs.code-quality-agent.outputs.status }}"
+          ARCH_STATUS="${{ needs.architect-agent.outputs.status }}"
+          LLD_STATUS="${{ needs.lld-alignment-agent.outputs.status }}"
+          JIRA_TICKET="${{ needs.jira-integration.outputs.ticket_key }}"
+
+          # Determine overall result
+          if [[ "$CODE_STATUS" == "FAIL" ]] || [[ "$LLD_STATUS" == "LLD_DEVIATION_FOUND" ]]; then
+            echo "result=BLOCKED" >> $GITHUB_OUTPUT
+            echo "can_merge=false" >> $GITHUB_OUTPUT
+          elif [[ "$ARCH_STATUS" == "NO_NEW_PATTERN" ]]; then
+            echo "result=APPROVED" >> $GITHUB_OUTPUT
+            echo "can_merge=true" >> $GITHUB_OUTPUT
+            echo "path=FAST_PATH" >> $GITHUB_OUTPUT
+          else
+            echo "result=WAITING_REVIEW" >> $GITHUB_OUTPUT
+            echo "can_merge=false" >> $GITHUB_OUTPUT
+            echo "path=FULL_PATH" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Post final comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const result = '${{ steps.final-status.outputs.result }}';
+            const canMerge = '${{ steps.final-status.outputs.can_merge }}' === 'true';
+            const path = '${{ steps.final-status.outputs.path }}' || 'FULL_PATH';
+            const workflowId = '${{ needs.pre-flight.outputs.workflow_id }}';
+            const jiraTicket = '${{ needs.jira-integration.outputs.ticket_key }}';
+            const jiraUrl = '${{ needs.jira-integration.outputs.ticket_url }}';
+
+            const statusEmojis = {
+              'APPROVED': '✅',
+              'BLOCKED': '❌',
+              'WAITING_REVIEW': '⏳'
+            };
+
+            const getAgentEmoji = (status) => {
+              if (!status || status === 'Skipped') return '⏭️';
+              if (status === 'PASS' || status === 'NO_NEW_PATTERN' || status === 'LLD_COMPLIANT') return '✅';
+              if (status === 'FAIL' || status === 'LLD_DEVIATION_FOUND') return '❌';
+              return '🔄';
+            };
+
+            let body = `## 🤖 PR Peer Review Complete
+
+            **Workflow ID**: \`${workflowId}\`
+            **Result**: ${statusEmojis[result]} ${result}
+            **Path**: ${path}
+
+            | Agent | Status |
+            |-------|--------|
+            | Code Quality | ${getAgentEmoji('${{ needs.code-quality-agent.outputs.status }}')} ${{ needs.code-quality-agent.outputs.status || 'N/A' }} |
+            | Architecture | ${getAgentEmoji('${{ needs.architect-agent.outputs.status }}')} ${{ needs.architect-agent.outputs.status || 'N/A' }} |
+            | LLD Alignment | ${getAgentEmoji('${{ needs.lld-alignment-agent.outputs.status }}')} ${{ needs.lld-alignment-agent.outputs.status || 'Skipped' }} |
+            | Peer Review | ${getAgentEmoji('${{ needs.peer-review-agent.outputs.status }}')} ${{ needs.peer-review-agent.outputs.status || 'Skipped' }} |
+            `;
+
+            if (jiraTicket) {
+              body += `\n**Jira Ticket**: [${jiraTicket}](${jiraUrl})\n`;
+            }
+
+            if (canMerge) {
+              body += `\n### ✅ Ready to Merge\nAll checks have passed. This PR can be merged.`;
+            } else if (result === 'BLOCKED') {
+              body += `\n### ❌ Blocked\nPlease fix the issues above and push changes to re-run the review.`;
+            } else {
+              body += `\n### ⏳ Waiting for Review\nThis PR requires human review before it can be merged.`;
+            }
+
+            body += `\n\n---\n*Generated by PR Orchestrator Agent v${{ env.WORKFLOW_VERSION }}*`;
+
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });
+
+      - name: Set workflow conclusion
+        if: steps.final-status.outputs.result == 'BLOCKED'
+        run: |
+          echo "::error::PR review failed - see Jira ticket for details"
+          exit 1

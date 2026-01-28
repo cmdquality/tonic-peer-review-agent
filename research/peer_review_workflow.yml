@@ -1,0 +1,754 @@
+# GitHub Actions Workflow: PR Peer Review Orchestration
+#
+# This workflow orchestrates an automated and human-driven peer review process for pull requests.
+# It validates code quality, detects new patterns, ensures LLD alignment, and manages human reviews.
+#
+# Workflow Steps:
+# 1. Pre-flight: Validate PR and detect changes
+# 2. Code Quality Agent: Run code best practices validation
+# 3. Architect Agent: Detect new patterns (conditional on code quality pass)
+# 4. LLD Alignment Agent: Validate LLD compliance (conditional on new pattern detection)
+# 5. Pattern Matching Agent: Store approved patterns (conditional)
+# 6. Peer Review Agent: Manage human architectural review (conditional on new pattern)
+# 7. Jira Integration: Create tickets for failures (conditional)
+# 8. Final Report: Aggregate results and post PR comment
+
+name: PR Peer Review Orchestration
+
+# ============================================================================
+# WORKFLOW TRIGGERS
+# ============================================================================
+
+on:
+  # Pull request events
+  pull_request:
+    types:
+      - opened        # New PR created
+      - synchronize   # New commits pushed to PR
+      - reopened      # Previously closed PR reopened
+    branches:
+      - main
+      - develop
+      - 'release/**'
+
+  # Merge group support (for merge queues)
+  merge_group:
+    types:
+      - checks_requested
+
+  # Manual workflow dispatch for testing
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'PR number to review'
+        required: true
+        type: number
+
+# ============================================================================
+# CONCURRENCY CONTROL
+# ============================================================================
+
+concurrency:
+  # Cancel in-progress runs for the same PR
+  group: pr-review-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+# ============================================================================
+# ENVIRONMENT VARIABLES
+# ============================================================================
+
+env:
+  # Agent Configuration
+  AGENT_TIMEOUT: 30000                    # Agent timeout in milliseconds (30 seconds)
+  CODE_AGENT_SLA: 30                      # Code Best Practices Agent SLA (seconds)
+  ARCHITECT_AGENT_SLA: 10                 # Architect Agent SLA (seconds)
+  LLD_AGENT_SLA: 20                       # LLD Alignment Agent SLA (seconds)
+  PATTERN_AGENT_SLA: 5                    # Pattern Matching Agent SLA (seconds)
+  PEER_REVIEW_SLA: 14400                  # Peer Review SLA (4 hours in seconds)
+
+  # Confluence Configuration
+  CONFLUENCE_BASE_URL: ${{ secrets.CONFLUENCE_BASE_URL || 'https://confluence.tonic.com' }}
+  CONFLUENCE_SPACE_PATTERNS: 'SCM-PATTERNS'
+  CONFLUENCE_SPACE_LLD: 'SCM-LLD'
+
+  # Jira Configuration
+  JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL || 'https://tonic.atlassian.net' }}
+  JIRA_PROJECT: 'SCM'
+  JIRA_DEFAULT_ASSIGNEE: ${{ secrets.JIRA_DEFAULT_ASSIGNEE || 'architecture-team-lead@tonic.com' }}
+
+  # GitHub Configuration
+  PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
+  REPOSITORY: ${{ github.repository }}
+
+  # AWS Configuration (for agents deployed on AWS)
+  AWS_REGION: us-east-1
+
+  # Workflow Configuration
+  WORKFLOW_ID: ${{ github.run_id }}
+  WORKFLOW_RUN_NUMBER: ${{ github.run_number }}
+
+# ============================================================================
+# DEFAULT SETTINGS
+# ============================================================================
+
+defaults:
+  run:
+    shell: bash
+
+# ============================================================================
+# JOBS
+# ============================================================================
+
+jobs:
+
+  # ==========================================================================
+  # JOB 1: PRE-FLIGHT CHECKS
+  # ==========================================================================
+
+  pre-flight:
+    name: Pre-Flight Validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    outputs:
+      has-code-changes: ${{ steps.detect-changes.outputs.has-code-changes }}
+      changed-files: ${{ steps.detect-changes.outputs.changed-files }}
+      pr-valid: ${{ steps.validate-pr.outputs.valid }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for change detection
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Validate PR
+        id: validate-pr
+        run: |
+          echo "Validating PR #$PR_NUMBER"
+
+          # Check if PR exists and is open
+          PR_STATE=$(gh pr view $PR_NUMBER --json state --jq '.state')
+
+          if [ "$PR_STATE" != "OPEN" ]; then
+            echo "::error::PR #$PR_NUMBER is not open (state: $PR_STATE)"
+            echo "valid=false" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+          echo "✅ PR #$PR_NUMBER is valid and open"
+          echo "valid=true" >> $GITHUB_OUTPUT
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Detect changes
+        id: detect-changes
+        run: |
+          echo "Detecting code changes in PR #$PR_NUMBER"
+
+          # Get list of changed files
+          CHANGED_FILES=$(gh pr view $PR_NUMBER --json files --jq '.files[].path' | tr '\n' ',' | sed 's/,$//')
+          echo "changed-files=$CHANGED_FILES" >> $GITHUB_OUTPUT
+
+          # Detect if there are actual code changes (exclude docs, configs)
+          CODE_CHANGES=$(gh pr view $PR_NUMBER --json files --jq '.files[].path' | grep -E '\.(java|py|js|ts|go|rb|cs|cpp|c|h)$' || true)
+
+          if [ -n "$CODE_CHANGES" ]; then
+            echo "has-code-changes=true" >> $GITHUB_OUTPUT
+            echo "✅ Code changes detected"
+          else
+            echo "has-code-changes=false" >> $GITHUB_OUTPUT
+            echo "ℹ️ No code changes detected (docs/config only)"
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Post pre-flight status
+        if: always()
+        run: |
+          gh pr comment $PR_NUMBER --body "## 🚀 Pre-Flight Checks
+
+          **Status**: ${{ steps.validate-pr.outputs.valid == 'true' && '✅ PASSED' || '❌ FAILED' }}
+          **Code Changes**: ${{ steps.detect-changes.outputs.has-code-changes == 'true' && 'Yes' || 'No' }}
+          **Workflow Run**: [${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+
+          Starting peer review workflow..."
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+  # ==========================================================================
+  # JOB 2: CODE QUALITY AGENT
+  # ==========================================================================
+
+  code-quality-agent:
+    name: Code Best Practices Agent
+    needs: pre-flight
+    if: needs.pre-flight.outputs.has-code-changes == 'true' && needs.pre-flight.outputs.pr-valid == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 2  # 30 second SLA + buffer
+
+    outputs:
+      status: ${{ steps.run-agent.outputs.status }}
+      violations-count: ${{ steps.run-agent.outputs.violations-count }}
+      violations-report: ${{ steps.run-agent.outputs.violations-report }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Setup agent environment
+        run: |
+          echo "Setting up Code Best Practices Agent"
+          # Install dependencies, setup Java/Python environment, etc.
+          # This is a placeholder for actual agent setup
+
+      - name: Run Code Best Practices Agent
+        id: run-agent
+        timeout-minutes: 1
+        continue-on-error: true  # Don't fail workflow, handle in next step
+        run: |
+          echo "Running Code Best Practices Agent (SLA: ${CODE_AGENT_SLA}s)"
+
+          # TODO: Replace with actual agent invocation
+          # This is a placeholder that simulates agent execution
+
+          # Example: Call Lambda function or containerized agent
+          # RESULT=$(aws lambda invoke \
+          #   --function-name code-best-practices-agent \
+          #   --payload "{\"pr_number\": $PR_NUMBER, \"repository\": \"$REPOSITORY\"}" \
+          #   --region $AWS_REGION \
+          #   response.json)
+
+          # For demonstration, simulating success
+          VIOLATIONS_COUNT=0
+          STATUS="PASSED"
+
+          echo "status=$STATUS" >> $GITHUB_OUTPUT
+          echo "violations-count=$VIOLATIONS_COUNT" >> $GITHUB_OUTPUT
+          echo "violations-report={}" >> $GITHUB_OUTPUT
+
+          if [ "$STATUS" == "FAILED" ]; then
+            echo "::error::Code quality violations detected"
+            exit 1
+          fi
+
+          echo "✅ Code Best Practices: $STATUS (${VIOLATIONS_COUNT} violations)"
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          CONFLUENCE_API_TOKEN: ${{ secrets.CONFLUENCE_API_TOKEN }}
+
+      - name: Post code quality results
+        if: always()
+        run: |
+          VIOLATIONS_COUNT="${{ steps.run-agent.outputs.violations-count }}"
+          STATUS="${{ steps.run-agent.outputs.status }}"
+
+          if [ "$STATUS" == "PASSED" ]; then
+            EMOJI="✅"
+            TITLE="Code Best Practices - PASSED"
+          else
+            EMOJI="❌"
+            TITLE="Code Best Practices - FAILED"
+          fi
+
+          gh pr comment $PR_NUMBER --body "## $EMOJI $TITLE
+
+          **Analysis Time**: ${{ job.status == 'success' && 'Within SLA' || 'Timeout/Error' }}
+          **Violations Found**: ${VIOLATIONS_COUNT}
+
+          ${{ steps.run-agent.outputs.violations-count > 0 && '### Violations\n\nSee detailed violation report in workflow logs.' || 'No violations detected. Code meets best practices standards.' }}
+          "
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+  # ==========================================================================
+  # JOB 3: ARCHITECT AGENT (NEW PATTERN DETECTION)
+  # ==========================================================================
+
+  architect-agent:
+    name: Architect Best Practices Agent
+    needs: code-quality-agent
+    if: needs.code-quality-agent.outputs.status == 'PASSED'
+    runs-on: ubuntu-latest
+    timeout-minutes: 1  # 10 second SLA + buffer
+
+    outputs:
+      status: ${{ steps.run-agent.outputs.status }}
+      new-pattern-detected: ${{ steps.run-agent.outputs.new-pattern-detected }}
+      pattern-data: ${{ steps.run-agent.outputs.pattern-data }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Run Architect Best Practices Agent
+        id: run-agent
+        timeout-minutes: 1
+        run: |
+          echo "Running Architect Best Practices Agent (SLA: ${ARCHITECT_AGENT_SLA}s)"
+
+          # TODO: Replace with actual agent invocation
+          # For demonstration, simulating pattern detection
+          NEW_PATTERN_DETECTED="false"
+          STATUS="NO_NEW_PATTERN"
+          PATTERN_DATA="{}"
+
+          echo "status=$STATUS" >> $GITHUB_OUTPUT
+          echo "new-pattern-detected=$NEW_PATTERN_DETECTED" >> $GITHUB_OUTPUT
+          echo "pattern-data=$PATTERN_DATA" >> $GITHUB_OUTPUT
+
+          echo "✅ Architect Agent: $STATUS"
+        env:
+          CONFLUENCE_API_TOKEN: ${{ secrets.CONFLUENCE_API_TOKEN }}
+
+      - name: Add pattern detection label
+        if: steps.run-agent.outputs.new-pattern-detected == 'true'
+        run: |
+          gh pr edit $PR_NUMBER --add-label "new-pattern-detected"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Post pattern detection results
+        run: |
+          STATUS="${{ steps.run-agent.outputs.status }}"
+          NEW_PATTERN="${{ steps.run-agent.outputs.new-pattern-detected }}"
+
+          if [ "$NEW_PATTERN" == "true" ]; then
+            EMOJI="🔍"
+            TITLE="New Pattern Detected"
+            MESSAGE="A new architectural pattern has been detected. LLD alignment review and peer review are required."
+          else
+            EMOJI="✅"
+            TITLE="No New Patterns"
+            MESSAGE="Code uses existing approved patterns. Skipping to deployment."
+          fi
+
+          gh pr comment $PR_NUMBER --body "## $EMOJI $TITLE
+
+          **Status**: $STATUS
+
+          $MESSAGE
+          "
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+  # ==========================================================================
+  # JOB 4: LLD ALIGNMENT AGENT
+  # ==========================================================================
+
+  lld-alignment-agent:
+    name: LLD Alignment Review Agent
+    needs: architect-agent
+    if: needs.architect-agent.outputs.new-pattern-detected == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 1  # 20 second SLA + buffer
+
+    outputs:
+      status: ${{ steps.run-agent.outputs.status }}
+      lld-compliant: ${{ steps.run-agent.outputs.lld-compliant }}
+      deviations-count: ${{ steps.run-agent.outputs.deviations-count }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Run LLD Alignment Review Agent
+        id: run-agent
+        timeout-minutes: 1
+        continue-on-error: true
+        run: |
+          echo "Running LLD Alignment Review Agent (SLA: ${LLD_AGENT_SLA}s)"
+
+          # TODO: Replace with actual agent invocation
+          # For demonstration, simulating LLD compliance
+          LLD_COMPLIANT="true"
+          STATUS="LLD_COMPLIANT"
+          DEVIATIONS_COUNT=0
+
+          echo "status=$STATUS" >> $GITHUB_OUTPUT
+          echo "lld-compliant=$LLD_COMPLIANT" >> $GITHUB_OUTPUT
+          echo "deviations-count=$DEVIATIONS_COUNT" >> $GITHUB_OUTPUT
+
+          if [ "$LLD_COMPLIANT" == "false" ]; then
+            echo "::error::LLD deviations detected"
+            exit 1
+          fi
+
+          echo "✅ LLD Alignment: $STATUS"
+        env:
+          CONFLUENCE_API_TOKEN: ${{ secrets.CONFLUENCE_API_TOKEN }}
+
+      - name: Post LLD alignment results
+        if: always()
+        run: |
+          STATUS="${{ steps.run-agent.outputs.status }}"
+          LLD_COMPLIANT="${{ steps.run-agent.outputs.lld-compliant }}"
+          DEVIATIONS_COUNT="${{ steps.run-agent.outputs.deviations-count }}"
+
+          if [ "$LLD_COMPLIANT" == "true" ]; then
+            EMOJI="✅"
+            TITLE="LLD Alignment - COMPLIANT"
+            MESSAGE="New pattern aligns with LLD specifications. Proceeding to peer review."
+          else
+            EMOJI="❌"
+            TITLE="LLD Alignment - DEVIATIONS FOUND"
+            MESSAGE="LLD deviations detected. Review and fix required before proceeding."
+          fi
+
+          gh pr comment $PR_NUMBER --body "## $EMOJI $TITLE
+
+          **Status**: $STATUS
+          **Deviations**: ${DEVIATIONS_COUNT}
+
+          $MESSAGE
+          "
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+  # ==========================================================================
+  # JOB 5: PEER REVIEW AGENT (HUMAN REVIEW ORCHESTRATION)
+  # ==========================================================================
+
+  peer-review-agent:
+    name: Peer Review Documentation Agent
+    needs: lld-alignment-agent
+    if: needs.lld-alignment-agent.outputs.lld-compliant == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    outputs:
+      status: ${{ steps.assign-reviewers.outputs.status }}
+      reviewers-assigned: ${{ steps.assign-reviewers.outputs.reviewers-assigned }}
+
+    steps:
+      - name: Assign reviewers
+        id: assign-reviewers
+        run: |
+          echo "Assigning reviewers for new pattern review"
+
+          # TODO: Replace with actual reviewer assignment logic
+          # This should query team configuration and assign appropriate reviewers
+
+          # Example: Call Peer Review Agent to assign reviewers
+          REVIEWERS="architect1,senior-eng1"
+
+          # Assign reviewers to PR
+          for REVIEWER in $(echo $REVIEWERS | tr ',' ' '); do
+            gh pr edit $PR_NUMBER --add-reviewer "$REVIEWER" || true
+          done
+
+          echo "status=REVIEWERS_ASSIGNED" >> $GITHUB_OUTPUT
+          echo "reviewers-assigned=$REVIEWERS" >> $GITHUB_OUTPUT
+
+          echo "✅ Reviewers assigned: $REVIEWERS"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Post review request
+        run: |
+          REVIEWERS="${{ steps.assign-reviewers.outputs.reviewers-assigned }}"
+          SLA_HOURS=$((PEER_REVIEW_SLA / 3600))
+
+          gh pr comment $PR_NUMBER --body "## 🔍 Pattern Review Request
+
+          A new pattern has been detected and validated. Architectural review is required before approval.
+
+          ### Assigned Reviewers
+
+          $(echo "$REVIEWERS" | tr ',' '\n' | sed 's/^/- @/')
+
+          **Required**: Minimum 1 architect approval to merge
+
+          ### SLA
+
+          ⏱️ **Review SLA**: ${SLA_HOURS} hours from now
+
+          ---
+
+          **Documentation**: Full pattern documentation will be added to the Pattern Library upon approval.
+          "
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Start SLA monitoring
+        run: |
+          echo "Starting SLA monitoring for peer review"
+
+          # TODO: Implement SLA monitoring
+          # This could trigger a scheduled workflow or external system to monitor review SLA
+
+          echo "ℹ️ SLA monitoring started (${PEER_REVIEW_SLA}s)"
+
+  # ==========================================================================
+  # JOB 6: PATTERN MATCHING AGENT (PATTERN STORAGE)
+  # ==========================================================================
+
+  pattern-matching-agent:
+    name: Pattern Matching Agent
+    needs: [architect-agent, lld-alignment-agent, peer-review-agent]
+    # Only run after PR is merged (this would be in a separate workflow on push to main)
+    # For now, this is a placeholder showing the integration point
+    if: false  # Disabled - runs in post-merge workflow
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+
+    steps:
+      - name: Store approved pattern
+        run: |
+          echo "Storing approved pattern in Confluence"
+
+          # TODO: Replace with actual pattern storage logic
+          # This should only run after PR is merged and pattern is approved
+
+          echo "✅ Pattern stored in Confluence"
+        env:
+          CONFLUENCE_API_TOKEN: ${{ secrets.CONFLUENCE_API_TOKEN }}
+
+  # ==========================================================================
+  # JOB 7: JIRA INTEGRATION (FAILURE HANDLING)
+  # ==========================================================================
+
+  jira-integration:
+    name: Jira Integration Agent
+    needs: [code-quality-agent, lld-alignment-agent]
+    # Run if any validation step failed
+    if: |
+      always() && (
+        needs.code-quality-agent.outputs.status == 'FAILED' ||
+        needs.lld-alignment-agent.outputs.lld-compliant == 'false'
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+
+    outputs:
+      jira-ticket-id: ${{ steps.create-ticket.outputs.ticket-id }}
+
+    steps:
+      - name: Determine issue type
+        id: determine-issue
+        run: |
+          CODE_STATUS="${{ needs.code-quality-agent.outputs.status }}"
+          LLD_STATUS="${{ needs.lld-alignment-agent.outputs.lld-compliant }}"
+
+          if [ "$CODE_STATUS" == "FAILED" ]; then
+            ISSUE_TYPE="CODE_VIOLATION"
+            PRIORITY="Medium"
+            SUMMARY="Code violations in PR #$PR_NUMBER"
+          elif [ "$LLD_STATUS" == "false" ]; then
+            ISSUE_TYPE="LLD_DEVIATION"
+            PRIORITY="High"
+            SUMMARY="LLD deviation in PR #$PR_NUMBER"
+          else
+            ISSUE_TYPE="UNKNOWN"
+            PRIORITY="Low"
+            SUMMARY="Issue in PR #$PR_NUMBER"
+          fi
+
+          echo "issue-type=$ISSUE_TYPE" >> $GITHUB_OUTPUT
+          echo "priority=$PRIORITY" >> $GITHUB_OUTPUT
+          echo "summary=$SUMMARY" >> $GITHUB_OUTPUT
+
+      - name: Create Jira ticket
+        id: create-ticket
+        continue-on-error: true
+        run: |
+          echo "Creating Jira ticket for issue: ${{ steps.determine-issue.outputs.issue-type }}"
+
+          ISSUE_TYPE="${{ steps.determine-issue.outputs.issue-type }}"
+          PRIORITY="${{ steps.determine-issue.outputs.priority }}"
+          SUMMARY="${{ steps.determine-issue.outputs.summary }}"
+
+          # TODO: Replace with actual Jira API call
+          # Example using curl:
+          # RESPONSE=$(curl -X POST \
+          #   -H "Content-Type: application/json" \
+          #   -H "Authorization: Bearer $JIRA_API_TOKEN" \
+          #   -d "{
+          #     \"fields\": {
+          #       \"project\": {\"key\": \"$JIRA_PROJECT\"},
+          #       \"issuetype\": {\"name\": \"$ISSUE_TYPE\"},
+          #       \"summary\": \"$SUMMARY\",
+          #       \"priority\": {\"name\": \"$PRIORITY\"},
+          #       \"description\": \"PR: ${{ github.event.pull_request.html_url }}\"
+          #     }
+          #   }" \
+          #   "$JIRA_BASE_URL/rest/api/3/issue")
+
+          # For demonstration, simulating ticket creation
+          TICKET_ID="SCM-999"
+
+          echo "ticket-id=$TICKET_ID" >> $GITHUB_OUTPUT
+          echo "✅ Jira ticket created: $TICKET_ID"
+        env:
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          JIRA_USER_EMAIL: ${{ secrets.JIRA_USER_EMAIL }}
+
+      - name: Post Jira ticket link to PR
+        if: steps.create-ticket.outputs.ticket-id != ''
+        run: |
+          TICKET_ID="${{ steps.create-ticket.outputs.ticket-id }}"
+
+          gh pr comment $PR_NUMBER --body "## 📋 Jira Ticket Created
+
+          **Ticket**: [$TICKET_ID]($JIRA_BASE_URL/browse/$TICKET_ID)
+          **Type**: ${{ steps.determine-issue.outputs.issue-type }}
+          **Priority**: ${{ steps.determine-issue.outputs.priority }}
+
+          This ticket tracks the issues that must be resolved before PR can be merged.
+          "
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Handle Jira failure
+        if: steps.create-ticket.outcome == 'failure'
+        run: |
+          echo "::warning::Failed to create Jira ticket. Issue will be tracked in PR only."
+
+          gh pr comment $PR_NUMBER --body "## ⚠️ Jira Ticket Pending
+
+          A Jira ticket will be created once Jira connectivity is restored.
+
+          **Issue Type**: ${{ steps.determine-issue.outputs.issue-type }}
+          **Priority**: ${{ steps.determine-issue.outputs.priority }}
+
+          Please track this issue in the PR comments for now.
+          "
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+  # ==========================================================================
+  # JOB 8: FINAL REPORT (AGGREGATION)
+  # ==========================================================================
+
+  final-report:
+    name: Final Report
+    needs: [pre-flight, code-quality-agent, architect-agent, lld-alignment-agent, peer-review-agent, jira-integration]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Aggregate results
+        id: aggregate
+        run: |
+          echo "Aggregating workflow results"
+
+          # Determine overall status
+          CODE_STATUS="${{ needs.code-quality-agent.outputs.status }}"
+          ARCHITECT_STATUS="${{ needs.architect-agent.outputs.status }}"
+          LLD_STATUS="${{ needs.lld-alignment-agent.outputs.status }}"
+          PEER_REVIEW_STATUS="${{ needs.peer-review-agent.outputs.status }}"
+
+          if [ "$CODE_STATUS" == "FAILED" ] || [ "$LLD_STATUS" == "LLD_DEVIATION_FOUND" ]; then
+            OVERALL_STATUS="FAILED"
+            EMOJI="❌"
+          elif [ "$PEER_REVIEW_STATUS" == "REVIEWERS_ASSIGNED" ]; then
+            OVERALL_STATUS="PENDING_REVIEW"
+            EMOJI="⏳"
+          elif [ "$ARCHITECT_STATUS" == "NO_NEW_PATTERN" ]; then
+            OVERALL_STATUS="PASSED"
+            EMOJI="✅"
+          else
+            OVERALL_STATUS="IN_PROGRESS"
+            EMOJI="🔄"
+          fi
+
+          echo "overall-status=$OVERALL_STATUS" >> $GITHUB_OUTPUT
+          echo "emoji=$EMOJI" >> $GITHUB_OUTPUT
+
+          echo "📊 Overall Status: $OVERALL_STATUS"
+
+      - name: Post final report
+        run: |
+          OVERALL_STATUS="${{ steps.aggregate.outputs.overall-status }}"
+          EMOJI="${{ steps.aggregate.outputs.emoji }}"
+
+          # Build status table
+          CODE_STATUS="${{ needs.code-quality-agent.outputs.status || 'SKIPPED' }}"
+          ARCHITECT_STATUS="${{ needs.architect-agent.outputs.status || 'SKIPPED' }}"
+          LLD_STATUS="${{ needs.lld-alignment-agent.outputs.status || 'SKIPPED' }}"
+          PEER_REVIEW_STATUS="${{ needs.peer-review-agent.outputs.status || 'SKIPPED' }}"
+          JIRA_TICKET="${{ needs.jira-integration.outputs.jira-ticket-id || 'N/A' }}"
+
+          # Generate status emojis
+          CODE_EMOJI=$([ "$CODE_STATUS" == "PASSED" ] && echo "✅" || ([ "$CODE_STATUS" == "FAILED" ] && echo "❌" || echo "⏭️"))
+          ARCHITECT_EMOJI=$([ "$ARCHITECT_STATUS" == "NO_NEW_PATTERN" ] || [ "$ARCHITECT_STATUS" == "NEW_PATTERN_FOUND" ] && echo "✅" || echo "⏭️")
+          LLD_EMOJI=$([ "$LLD_STATUS" == "LLD_COMPLIANT" ] && echo "✅" || ([ "$LLD_STATUS" == "LLD_DEVIATION_FOUND" ] && echo "❌" || echo "⏭️"))
+          PEER_REVIEW_EMOJI=$([ "$PEER_REVIEW_STATUS" == "REVIEWERS_ASSIGNED" ] && echo "⏳" || echo "⏭️")
+
+          gh pr comment $PR_NUMBER --body "## $EMOJI PR Peer Review Summary
+
+          **Overall Status**: **$OVERALL_STATUS**
+          **Workflow Run**: [${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+
+          ### Validation Results
+
+          | Step | Status | Details |
+          |------|--------|---------|
+          | $CODE_EMOJI Code Best Practices | $CODE_STATUS | ${{ needs.code-quality-agent.outputs.violations-count || '0' }} violations |
+          | $ARCHITECT_EMOJI Pattern Detection | $ARCHITECT_STATUS | New pattern: ${{ needs.architect-agent.outputs.new-pattern-detected || 'false' }} |
+          | $LLD_EMOJI LLD Alignment | $LLD_STATUS | Deviations: ${{ needs.lld-alignment-agent.outputs.deviations-count || '0' }} |
+          | $PEER_REVIEW_EMOJI Peer Review | $PEER_REVIEW_STATUS | Reviewers: ${{ needs.peer-review-agent.outputs.reviewers-assigned || 'N/A' }} |
+
+          ${{ needs.jira-integration.outputs.jira-ticket-id != '' && format('### Jira Ticket\n\n**Ticket**: [{0}]({1}/browse/{0})', needs.jira-integration.outputs.jira-ticket-id, env.JIRA_BASE_URL) || '' }}
+
+          ---
+
+          ${{ steps.aggregate.outputs.overall-status == 'PASSED' && '✅ **All checks passed!** PR is ready to merge.' || '' }}
+          ${{ steps.aggregate.outputs.overall-status == 'PENDING_REVIEW' && '⏳ **Awaiting peer review.** Please complete architectural review within SLA.' || '' }}
+          ${{ steps.aggregate.outputs.overall-status == 'FAILED' && '❌ **Action required.** Fix violations before PR can be merged.' || '' }}
+          "
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Set PR status check
+        if: always()
+        run: |
+          OVERALL_STATUS="${{ steps.aggregate.outputs.overall-status }}"
+
+          if [ "$OVERALL_STATUS" == "PASSED" ]; then
+            CONCLUSION="success"
+            SUMMARY="All peer review checks passed"
+          elif [ "$OVERALL_STATUS" == "PENDING_REVIEW" ]; then
+            CONCLUSION="neutral"
+            SUMMARY="Awaiting peer review approval"
+          elif [ "$OVERALL_STATUS" == "FAILED" ]; then
+            CONCLUSION="failure"
+            SUMMARY="Peer review checks failed"
+          else
+            CONCLUSION="neutral"
+            SUMMARY="Peer review in progress"
+          fi
+
+          echo "Setting status check: $CONCLUSION - $SUMMARY"
+
+          # This would integrate with GitHub status checks API
+          # For now, just logging the status
+
+      - name: Cleanup
+        if: always()
+        run: |
+          echo "Workflow completed: ${{ steps.aggregate.outputs.overall-status }}"
+          echo "Cleaning up temporary resources..."
+
+# ============================================================================
+# WORKFLOW PERMISSIONS
+# ============================================================================
+
+permissions:
+  contents: read          # Read repository contents
+  pull-requests: write    # Comment on PRs, add labels, assign reviewers
+  issues: write           # Create issues if needed
+  statuses: write         # Set commit statuses
+  checks: write           # Create check runs
+
+# ============================================================================
+# END OF WORKFLOW
+# ============================================================================
