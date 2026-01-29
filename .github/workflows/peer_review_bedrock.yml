@@ -1,0 +1,632 @@
+# =============================================================================
+# PR Peer Review Orchestration Workflow (AWS Bedrock Version)
+# =============================================================================
+# This workflow orchestrates multiple agents to automate the peer review process
+# for pull requests using AWS Bedrock Claude models.
+#
+# LLM: Claude via AWS Bedrock (configurable: Haiku, Sonnet, or Opus)
+# Authentication: AWS OIDC (no long-lived credentials)
+#
+# Version: 2.0.0
+# Date: 2026-01-28
+# =============================================================================
+
+name: PR Peer Review (Bedrock)
+
+# =============================================================================
+# TRIGGERS
+# =============================================================================
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    branches:
+      - main
+      - develop
+      - 'release/**'
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - '.github/ISSUE_TEMPLATE/**'
+      - '.github/PULL_REQUEST_TEMPLATE/**'
+
+  # Support for merge queues
+  merge_group:
+    types: [checks_requested]
+
+  # Manual trigger for re-running
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'PR number to review'
+        required: true
+        type: number
+      model:
+        description: 'Claude model to use'
+        required: false
+        type: choice
+        options:
+          - haiku
+          - sonnet
+          - opus
+        default: haiku
+
+# =============================================================================
+# CONCURRENCY CONTROL
+# =============================================================================
+concurrency:
+  group: pr-review-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+# =============================================================================
+# PERMISSIONS
+# =============================================================================
+permissions:
+  id-token: write       # Required for AWS OIDC authentication
+  contents: read
+  pull-requests: write
+  issues: write
+  checks: write
+  statuses: write
+
+# =============================================================================
+# ENVIRONMENT VARIABLES
+# =============================================================================
+env:
+  # Workflow configuration
+  WORKFLOW_VERSION: '2.0.0'
+
+  # AWS Configuration
+  AWS_REGION: us-east-1
+
+  # Model Configuration (can be overridden per job)
+  DEFAULT_MODEL: haiku
+  CODE_QUALITY_MODEL: haiku      # Fast, cost-effective for standard reviews
+  ARCHITECT_MODEL: sonnet        # More capable for pattern detection
+  LLD_MODEL: sonnet              # Detailed analysis for LLD alignment
+
+  # SLA thresholds (in seconds)
+  CODE_QUALITY_SLA: 60
+  ARCHITECT_SLA: 45
+  LLD_ALIGNMENT_SLA: 60
+  JIRA_INTEGRATION_SLA: 15
+
+# =============================================================================
+# JOBS
+# =============================================================================
+jobs:
+  # ===========================================================================
+  # JOB 1: PRE-FLIGHT VALIDATION
+  # ===========================================================================
+  pre-flight:
+    name: Pre-Flight Validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    if: github.event.pull_request.draft != true
+
+    outputs:
+      should_run: ${{ steps.validation.outputs.should_run }}
+      has_code_changes: ${{ steps.changes.outputs.code }}
+      pr_author: ${{ steps.pr-info.outputs.author }}
+      pr_author_email: ${{ steps.pr-info.outputs.author_email }}
+      workflow_id: ${{ steps.workflow-id.outputs.id }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Generate workflow ID
+        id: workflow-id
+        run: |
+          WORKFLOW_ID="wf-$(date +%Y%m%d)-pr-${{ github.event.pull_request.number }}-$(git rev-parse --short HEAD)"
+          echo "id=$WORKFLOW_ID" >> $GITHUB_OUTPUT
+          echo "::notice::Workflow ID: $WORKFLOW_ID"
+
+      - name: Get PR information
+        id: pr-info
+        run: |
+          echo "author=${{ github.event.pull_request.user.login }}" >> $GITHUB_OUTPUT
+          echo "author_email=${{ github.event.pull_request.user.email || format('{0}@users.noreply.github.com', github.event.pull_request.user.login) }}" >> $GITHUB_OUTPUT
+
+      - name: Detect file changes
+        uses: dorny/paths-filter@v2
+        id: changes
+        with:
+          filters: |
+            code:
+              - 'src/**'
+              - 'lib/**'
+              - '**/*.java'
+              - '**/*.py'
+              - '**/*.ts'
+              - '**/*.js'
+              - '**/*.go'
+              - '**/*.cs'
+
+      - name: Validate PR
+        id: validation
+        run: |
+          if [[ "${{ contains(github.event.pull_request.labels.*.name, 'skip-peer-review') }}" == "true" ]]; then
+            echo "should_run=false" >> $GITHUB_OUTPUT
+            echo "::warning::Skipping peer review due to 'skip-peer-review' label"
+            exit 0
+          fi
+
+          if [[ "${{ steps.changes.outputs.code }}" != "true" ]]; then
+            echo "should_run=false" >> $GITHUB_OUTPUT
+            echo "::notice::No code changes detected, skipping peer review"
+            exit 0
+          fi
+
+          echo "should_run=true" >> $GITHUB_OUTPUT
+
+      - name: Post workflow start comment
+        if: steps.validation.outputs.should_run == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const body = `## 🤖 PR Peer Review Started (Bedrock)
+
+            **Workflow ID**: \`${{ steps.workflow-id.outputs.id }}\`
+            **LLM Provider**: AWS Bedrock (Claude)
+            **Started**: ${new Date().toISOString()}
+
+            | Agent | Model | Status |
+            |-------|-------|--------|
+            | Code Quality | Claude Haiku | ⏳ Pending |
+            | Architecture | Claude Sonnet | ⏳ Pending |
+            | LLD Alignment | Claude Sonnet | ⏳ Pending |
+
+            _This comment will be updated as agents complete._`;
+
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });
+
+  # ===========================================================================
+  # JOB 2: CODE QUALITY AGENT (Bedrock Claude)
+  # ===========================================================================
+  code-quality-agent:
+    name: Code Quality Review
+    runs-on: ubuntu-latest
+    needs: pre-flight
+    if: needs.pre-flight.outputs.should_run == 'true'
+    timeout-minutes: 10
+
+    outputs:
+      status: ${{ steps.analysis.outputs.status }}
+      violations_count: ${{ steps.analysis.outputs.violations_count }}
+      violations: ${{ steps.analysis.outputs.violations }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_BEDROCK_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          pip install boto3 botocore
+
+      - name: Run Code Quality Agent
+        id: analysis
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BEDROCK_MODEL: ${{ env.CODE_QUALITY_MODEL }}
+        run: |
+          START_TIME=$(date +%s)
+
+          echo "::group::Running Code Quality Agent with Claude ($BEDROCK_MODEL)"
+
+          # Run the Bedrock agent
+          RESULT=$(python .github/scripts/bedrock_agent_runner.py \
+            --agent code_quality \
+            --pr $PR_NUMBER \
+            --model $BEDROCK_MODEL \
+            --region ${{ env.AWS_REGION }} \
+            --output json 2>&1) || true
+
+          echo "Agent output: $RESULT"
+          echo "::endgroup::"
+
+          # Parse results
+          STATUS=$(echo "$RESULT" | jq -r '.status // "ERROR"')
+          VIOLATIONS_COUNT=$(echo "$RESULT" | jq -r '.violations_count // 0')
+          VIOLATIONS=$(echo "$RESULT" | jq -c '.violations // []')
+
+          echo "status=$STATUS" >> $GITHUB_OUTPUT
+          echo "violations_count=$VIOLATIONS_COUNT" >> $GITHUB_OUTPUT
+          echo "violations=$VIOLATIONS" >> $GITHUB_OUTPUT
+
+          END_TIME=$(date +%s)
+          DURATION=$((END_TIME - START_TIME))
+          echo "::notice::Code quality analysis completed in ${DURATION}s (SLA: ${{ env.CODE_QUALITY_SLA }}s)"
+
+          # Exit with error if violations found
+          if [[ "$STATUS" == "FAIL" ]]; then
+            echo "::error::Code quality check failed with $VIOLATIONS_COUNT violations"
+          fi
+
+  # ===========================================================================
+  # JOB 3: ARCHITECT AGENT (Bedrock Claude)
+  # ===========================================================================
+  architect-agent:
+    name: Architecture Review
+    runs-on: ubuntu-latest
+    needs: [pre-flight, code-quality-agent]
+    if: |
+      needs.pre-flight.outputs.should_run == 'true' &&
+      needs.code-quality-agent.outputs.status == 'PASS'
+    timeout-minutes: 10
+
+    outputs:
+      status: ${{ steps.analysis.outputs.status }}
+      new_pattern_found: ${{ steps.analysis.outputs.new_pattern_found }}
+      patterns: ${{ steps.analysis.outputs.patterns }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_BEDROCK_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install boto3 botocore
+
+      - name: Run Architecture Agent
+        id: analysis
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BEDROCK_MODEL: ${{ env.ARCHITECT_MODEL }}
+        run: |
+          START_TIME=$(date +%s)
+
+          echo "::group::Running Architect Agent with Claude ($BEDROCK_MODEL)"
+
+          RESULT=$(python .github/scripts/bedrock_agent_runner.py \
+            --agent architect \
+            --pr $PR_NUMBER \
+            --model $BEDROCK_MODEL \
+            --region ${{ env.AWS_REGION }} \
+            --output json 2>&1) || true
+
+          echo "Agent output: $RESULT"
+          echo "::endgroup::"
+
+          STATUS=$(echo "$RESULT" | jq -r '.status // "ERROR"')
+          NEW_PATTERN=$(echo "$RESULT" | jq -r '.new_pattern_found // false')
+          PATTERNS=$(echo "$RESULT" | jq -c '.patterns // []')
+
+          echo "status=$STATUS" >> $GITHUB_OUTPUT
+          echo "new_pattern_found=$NEW_PATTERN" >> $GITHUB_OUTPUT
+          echo "patterns=$PATTERNS" >> $GITHUB_OUTPUT
+
+          END_TIME=$(date +%s)
+          DURATION=$((END_TIME - START_TIME))
+          echo "::notice::Architecture analysis completed in ${DURATION}s (SLA: ${{ env.ARCHITECT_SLA }}s)"
+
+  # ===========================================================================
+  # JOB 4: LLD ALIGNMENT AGENT (Conditional - Bedrock Claude)
+  # ===========================================================================
+  lld-alignment-agent:
+    name: LLD Alignment Review
+    runs-on: ubuntu-latest
+    needs: [pre-flight, code-quality-agent, architect-agent]
+    if: |
+      needs.pre-flight.outputs.should_run == 'true' &&
+      needs.code-quality-agent.outputs.status == 'PASS' &&
+      needs.architect-agent.outputs.new_pattern_found == 'true'
+    timeout-minutes: 10
+
+    outputs:
+      status: ${{ steps.analysis.outputs.status }}
+      deviations: ${{ steps.analysis.outputs.deviations }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_BEDROCK_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install boto3 botocore
+
+      - name: Run LLD Alignment Agent
+        id: analysis
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BEDROCK_MODEL: ${{ env.LLD_MODEL }}
+          CONFLUENCE_API_TOKEN: ${{ secrets.CONFLUENCE_API_TOKEN }}
+          CONFLUENCE_BASE_URL: ${{ secrets.CONFLUENCE_BASE_URL }}
+        run: |
+          START_TIME=$(date +%s)
+
+          echo "::group::Running LLD Alignment Agent with Claude ($BEDROCK_MODEL)"
+
+          RESULT=$(python .github/scripts/bedrock_agent_runner.py \
+            --agent lld_alignment \
+            --pr $PR_NUMBER \
+            --model $BEDROCK_MODEL \
+            --region ${{ env.AWS_REGION }} \
+            --output json 2>&1) || true
+
+          echo "Agent output: $RESULT"
+          echo "::endgroup::"
+
+          STATUS=$(echo "$RESULT" | jq -r '.status // "ERROR"')
+          DEVIATIONS=$(echo "$RESULT" | jq -c '.deviations // []')
+
+          echo "status=$STATUS" >> $GITHUB_OUTPUT
+          echo "deviations=$DEVIATIONS" >> $GITHUB_OUTPUT
+
+          END_TIME=$(date +%s)
+          DURATION=$((END_TIME - START_TIME))
+          echo "::notice::LLD alignment review completed in ${DURATION}s (SLA: ${{ env.LLD_ALIGNMENT_SLA }}s)"
+
+  # ===========================================================================
+  # JOB 5: JIRA INTEGRATION (On Failure)
+  # ===========================================================================
+  jira-integration:
+    name: Jira Ticket Creation
+    runs-on: ubuntu-latest
+    needs: [pre-flight, code-quality-agent, architect-agent, lld-alignment-agent]
+    if: |
+      always() &&
+      needs.pre-flight.outputs.should_run == 'true' &&
+      (needs.code-quality-agent.outputs.status == 'FAIL' ||
+       needs.lld-alignment-agent.outputs.status == 'LLD_DEVIATION_FOUND')
+    timeout-minutes: 5
+
+    outputs:
+      ticket_key: ${{ steps.create-ticket.outputs.ticket_key }}
+      ticket_url: ${{ steps.create-ticket.outputs.ticket_url }}
+
+    steps:
+      - name: Determine failure type
+        id: failure-type
+        run: |
+          if [[ "${{ needs.code-quality-agent.outputs.status }}" == "FAIL" ]]; then
+            echo "type=CODE_VIOLATION" >> $GITHUB_OUTPUT
+            echo "violations=${{ needs.code-quality-agent.outputs.violations }}" >> $GITHUB_OUTPUT
+          elif [[ "${{ needs.lld-alignment-agent.outputs.status }}" == "LLD_DEVIATION_FOUND" ]]; then
+            echo "type=LLD_DEVIATION" >> $GITHUB_OUTPUT
+            echo "deviations=${{ needs.lld-alignment-agent.outputs.deviations }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create Jira ticket
+        id: create-ticket
+        env:
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
+          JIRA_USER_EMAIL: ${{ secrets.JIRA_USER_EMAIL }}
+        run: |
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          PR_URL="${{ github.event.pull_request.html_url }}"
+          PR_TITLE="${{ github.event.pull_request.title }}"
+          PR_AUTHOR="${{ needs.pre-flight.outputs.pr_author }}"
+          ISSUE_TYPE="${{ steps.failure-type.outputs.type }}"
+          WORKFLOW_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          # Create ticket
+          TICKET_DATA=$(cat <<EOF
+          {
+            "fields": {
+              "project": {"key": "SCM"},
+              "issuetype": {"name": "Bug"},
+              "summary": "[PR-${PR_NUMBER}] ${ISSUE_TYPE} - ${PR_TITLE}",
+              "description": {
+                "type": "doc",
+                "version": 1,
+                "content": [
+                  {
+                    "type": "panel",
+                    "attrs": {"panelType": "error"},
+                    "content": [
+                      {
+                        "type": "paragraph",
+                        "content": [{"type": "text", "text": "Automated peer review (AWS Bedrock Claude) detected issues."}]
+                      }
+                    ]
+                  },
+                  {
+                    "type": "paragraph",
+                    "content": [
+                      {"type": "text", "text": "PR: "},
+                      {"type": "text", "text": "#${PR_NUMBER}", "marks": [{"type": "link", "attrs": {"href": "${PR_URL}"}}]}
+                    ]
+                  },
+                  {
+                    "type": "paragraph",
+                    "content": [
+                      {"type": "text", "text": "Author: ${PR_AUTHOR}"}
+                    ]
+                  },
+                  {
+                    "type": "paragraph",
+                    "content": [
+                      {"type": "text", "text": "Workflow: "},
+                      {"type": "text", "text": "View Logs", "marks": [{"type": "link", "attrs": {"href": "${WORKFLOW_URL}"}}]}
+                    ]
+                  }
+                ]
+              },
+              "priority": {"name": "High"},
+              "labels": ["peer-review", "auto-created", "bedrock-claude", "pr-${PR_NUMBER}"]
+            }
+          }
+          EOF
+          )
+
+          RESPONSE=$(curl -s -X POST \
+            "${JIRA_BASE_URL}/rest/api/3/issue" \
+            -H "Authorization: Basic $(echo -n ${JIRA_USER_EMAIL}:${JIRA_API_TOKEN} | base64)" \
+            -H "Content-Type: application/json" \
+            -d "$TICKET_DATA")
+
+          TICKET_KEY=$(echo $RESPONSE | jq -r '.key // empty')
+
+          if [ -z "$TICKET_KEY" ]; then
+            echo "::error::Failed to create Jira ticket"
+            echo "Response: $RESPONSE"
+            exit 1
+          fi
+
+          echo "ticket_key=$TICKET_KEY" >> $GITHUB_OUTPUT
+          echo "ticket_url=${JIRA_BASE_URL}/browse/${TICKET_KEY}" >> $GITHUB_OUTPUT
+          echo "::notice::Created Jira ticket: $TICKET_KEY"
+
+      - name: Comment on PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const ticketKey = '${{ steps.create-ticket.outputs.ticket_key }}';
+            const ticketUrl = '${{ steps.create-ticket.outputs.ticket_url }}';
+            const issueType = '${{ steps.failure-type.outputs.type }}';
+
+            const body = `## ❌ Peer Review Failed - Jira Ticket Created
+
+            **Issue Type**: ${issueType}
+            **Jira Ticket**: [${ticketKey}](${ticketUrl})
+            **Assigned To**: ${{ needs.pre-flight.outputs.pr_author }}
+            **LLM**: AWS Bedrock Claude
+
+            Please review the issues and push fixes. The PR will be re-evaluated automatically.`;
+
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });
+
+  # ===========================================================================
+  # JOB 6: FINAL REPORT
+  # ===========================================================================
+  final-report:
+    name: Final Report
+    runs-on: ubuntu-latest
+    needs: [pre-flight, code-quality-agent, architect-agent, lld-alignment-agent, jira-integration]
+    if: always() && needs.pre-flight.outputs.should_run == 'true'
+    timeout-minutes: 3
+
+    steps:
+      - name: Generate summary
+        run: |
+          echo "## PR Peer Review Summary (Bedrock)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Workflow ID**: ${{ needs.pre-flight.outputs.workflow_id }}" >> $GITHUB_STEP_SUMMARY
+          echo "**LLM Provider**: AWS Bedrock (Claude)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Agent | Model | Result |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|-------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Code Quality | Haiku | ${{ needs.code-quality-agent.outputs.status || 'N/A' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Architecture | Sonnet | ${{ needs.architect-agent.outputs.status || 'N/A' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| LLD Alignment | Sonnet | ${{ needs.lld-alignment-agent.outputs.status || 'Skipped' }} |" >> $GITHUB_STEP_SUMMARY
+
+      - name: Determine final status
+        id: final-status
+        run: |
+          CODE_STATUS="${{ needs.code-quality-agent.outputs.status }}"
+          LLD_STATUS="${{ needs.lld-alignment-agent.outputs.status }}"
+          ARCH_STATUS="${{ needs.architect-agent.outputs.status }}"
+
+          if [[ "$CODE_STATUS" == "FAIL" ]] || [[ "$LLD_STATUS" == "LLD_DEVIATION_FOUND" ]]; then
+            echo "result=BLOCKED" >> $GITHUB_OUTPUT
+            echo "can_merge=false" >> $GITHUB_OUTPUT
+          elif [[ "$ARCH_STATUS" == "NO_NEW_PATTERN" ]]; then
+            echo "result=APPROVED" >> $GITHUB_OUTPUT
+            echo "can_merge=true" >> $GITHUB_OUTPUT
+          else
+            echo "result=WAITING_REVIEW" >> $GITHUB_OUTPUT
+            echo "can_merge=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Post final comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const result = '${{ steps.final-status.outputs.result }}';
+            const canMerge = '${{ steps.final-status.outputs.can_merge }}' === 'true';
+            const jiraTicket = '${{ needs.jira-integration.outputs.ticket_key }}';
+            const jiraUrl = '${{ needs.jira-integration.outputs.ticket_url }}';
+
+            const statusEmojis = {
+              'APPROVED': '✅',
+              'BLOCKED': '❌',
+              'WAITING_REVIEW': '⏳'
+            };
+
+            let body = `## 🤖 PR Peer Review Complete (Bedrock)
+
+            **Result**: ${statusEmojis[result]} ${result}
+            **LLM**: AWS Bedrock Claude (Haiku/Sonnet)
+
+            | Agent | Model | Status |
+            |-------|-------|--------|
+            | Code Quality | Haiku | ${{ needs.code-quality-agent.outputs.status || 'N/A' }} |
+            | Architecture | Sonnet | ${{ needs.architect-agent.outputs.status || 'N/A' }} |
+            | LLD Alignment | Sonnet | ${{ needs.lld-alignment-agent.outputs.status || 'Skipped' }} |
+            `;
+
+            if (jiraTicket) {
+              body += `\n**Jira Ticket**: [${jiraTicket}](${jiraUrl})\n`;
+            }
+
+            if (canMerge) {
+              body += `\n### ✅ Ready to Merge\nAll checks have passed.`;
+            } else if (result === 'BLOCKED') {
+              body += `\n### ❌ Blocked\nPlease fix the issues and push changes.`;
+            }
+
+            body += `\n\n---\n*Generated by PR Orchestrator Agent v${{ env.WORKFLOW_VERSION }} (AWS Bedrock)*`;
+
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });
+
+      - name: Set workflow conclusion
+        if: steps.final-status.outputs.result == 'BLOCKED'
+        run: |
+          echo "::error::PR review failed - see Jira ticket for details"
+          exit 1

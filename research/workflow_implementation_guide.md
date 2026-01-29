@@ -15,7 +15,7 @@ This document provides a comprehensive guide to implementing the PR Peer Review 
 ### Workflow Diagram
 
 ```
-┌─────────────────┐
+┌─────────────────┐t
 │  PR Created/    │
 │  Updated        │
 └────────┬────────┘

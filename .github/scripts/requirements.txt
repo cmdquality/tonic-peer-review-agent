@@ -1,0 +1,11 @@
+# AWS Bedrock Agent Runner Dependencies
+# Choose ONE of the following options:
+
+# Option A: Synchronous (boto3) - simpler, for single calls per job
+# boto3>=1.34.0
+# botocore>=1.34.0
+
+# Option B: Asynchronous (aioboto3) - RECOMMENDED for parallel execution
+aioboto3>=13.1.0
+aiobotocore>=2.13.0
+aiohttp>=3.9.0
