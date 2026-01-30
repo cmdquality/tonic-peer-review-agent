@@ -26,6 +26,27 @@ The following skills are referenced by agents in this system (to be developed):
 **Purpose**: AST parsing, pattern matching, code validation techniques
 **Used By**: Code Best Practises Agent, Architect Best Practises Agent
 
+### 5. Pattern Mining Skill ✅ IMPLEMENTED
+**Purpose**: Read-only codebase analysis to identify design patterns, anti-patterns, and non-pattern code
+**Used By**: Pattern Mining Agent, Peer Review Agent, Pattern Matching Agent
+**Location**: `pattern_mining_skill.md`
+**Report Template**: `pattern_mining_report_template.md`
+**Agent**: `../agents/pattern_mining_agent.md`
+
+**Capabilities**:
+- EIP Pattern Detection (Apache Camel 4.14.x): Router, Mapper, Transformer, Adapter, Splitter, Aggregator
+- Core Java Pattern Detection: Facade/Controller, DAO/Repository, DTO/TO/Bean, Entity, Service, Factory
+- GoF Pattern Detection: Strategy, Observer, Command, Builder, Singleton
+- Anti-Pattern Detection: Circular References, Stovepipe, Monolith, God Object, Anemic Domain Model
+- Non-Pattern Code Identification
+- Structured Report Generation with numbered sections (X.Y.Z format)
+- Remediation Recommendations by priority (Critical, High, Medium, Low)
+
+**Pattern Catalogs**:
+- EIP Patterns: 25+ patterns from Apache Camel
+- Core Java Patterns: 15+ patterns including data access and business logic
+- Anti-Patterns: 14+ architectural, design, and integration anti-patterns
+
 ## Skill File Format
 
 Each skill document should follow this structure:
@@ -49,13 +70,27 @@ Each skill document should follow this structure:
 [How agents use this skill]
 ```
 
+## Implemented Skills
+
+| Skill | Status | Location |
+|-------|--------|----------|
+| Pattern Mining Skill | ✅ Implemented | `pattern_mining_skill.md` |
+| Pattern Mining Report Template | ✅ Implemented | `pattern_mining_report_template.md` |
+| Jira Ticket Skill | ✅ Implemented | `jira_ticket_skill.md` |
+| Orchestrator Skill | ✅ Implemented | `orchestrator_skill.md` |
+
+## Associated Agents
+
+| Agent | Skills Used | Location |
+|-------|-------------|----------|
+| Pattern Mining Agent | Pattern Mining Skill | `../agents/pattern_mining_agent.md` |
+
 ## Future Development
 
-Skills will be developed as agents are implemented. Priority skills:
+Skills to be developed as agents are implemented:
 1. GitHub API Skill (critical for all agents)
 2. Confluence API Skill (critical for pattern management)
-3. Jira API Skill (critical for issue tracking)
 
 ---
 
-**Note**: This folder serves as a placeholder. Skills will be added during implementation phase.
+**Last Updated**: 2026-01-30

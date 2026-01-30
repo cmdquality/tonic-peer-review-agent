@@ -5,10 +5,10 @@
 | Field | Value |
 |-------|-------|
 | **Research Topic** | Running Claude AI Agents in GitHub Actions using AWS Bedrock |
-| **Research Date** | 2026-01-28 |
+| **Research Date** | 2026-01-28 (Updated: 2026-01-30) |
 | **Research Method** | Technical documentation review, API analysis, implementation |
 | **Scope** | Option B: Python Script with AWS Bedrock SDK (aioboto3 async) |
-| **Status** | ✅ Complete with implementation delivered |
+| **Status** | ✅ Complete with implementation and HLD delivered |
 
 ---
 
@@ -18,6 +18,53 @@
 |------|-------------|----------|
 | **AWS_Bedrock_Claude_GitHub_Actions_Research.md** | Comprehensive research document with executive summary, analysis, and recommendations | `staging_1/` |
 | **aioboto3_vs_boto3_comparison.md** | Detailed comparison of async vs sync approaches | `staging_1/research/` |
+
+---
+
+## High-Level Design (HLD) Documents
+
+| File | Description | Location |
+|------|-------------|----------|
+| **PR_Peer_Review_System_HLD.md** | Complete HLD with system context, architecture, data flow, security, and cost model | `staging_1/hld/` |
+| **Architecture_Diagrams.md** | Detailed Mermaid diagrams showing GitHub → Lambda → Bedrock integration | `staging_1/hld/` |
+
+### HLD Sections Include:
+- System Context Diagram (C4 style)
+- Complete Architecture Overview
+- Lambda Function Architecture
+- Agent Orchestration Flow
+- Data Flow Diagrams
+- AWS Infrastructure Topology
+- IAM Permission Model
+- Async Execution Model (aioboto3)
+- Security Architecture (OIDC)
+- Error Handling & Circuit Breaker
+- Monitoring Dashboard
+- Cost Architecture
+- Deployment Pipeline
+
+---
+
+## Low-Level Design (LLD) Documents
+
+| File | Description | Location |
+|------|-------------|----------|
+| **Lambda_Bedrock_LLD.md** | Detailed LLD focusing on Lambda → Bedrock → External Integrations | `staging_1/lld/` |
+
+### LLD Sections Include:
+- Lambda Function Package Structure
+- Class Diagrams (UML)
+- Lambda Handler Implementation
+- Bedrock Service (aioboto3 async client)
+- Model Configuration & Cost Calculation
+- Base Agent & Concrete Implementations
+- Agent Orchestrator with Parallel Execution
+- Jira Service & ADF Format
+- Diff Chunker for Large PRs
+- Error Handling & Retry Logic
+- Data Models (PRContext, AgentResult, ReviewReport)
+- Lambda Layer Configuration
+- Environment Variables Reference
 
 ---
 
